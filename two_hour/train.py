@@ -91,6 +91,10 @@ parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768
                     help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
+parser.add_argument("--max-train-steps", type=int, default=0,
+                    help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
+parser.add_argument("--xsa-mode", choices=("off", "first6"), default="first6",
+                    help="Exclusive self-attention schedule.")
 args = parser.parse_args()
 args.window_schedule_spec = args.window_schedule.strip()
 
@@ -274,6 +278,8 @@ class GPTConfig:
     use_iha: bool = False
     iha_mix_v: bool = True
     use_window_schedule: bool = False
+    xsa_mode: str = "first6"
+    xsa_eps: float = 1e-4
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -349,6 +355,7 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
+        self.xsa_eps = config.xsa_eps
         # IHA: cross-head mixing matrices fused into projection weights at forward time.
         self.use_iha = config.use_iha
         if self.use_iha:
@@ -362,7 +369,7 @@ class CausalSelfAttention(nn.Module):
         d = self.head_dim
         return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None, xsa_alpha=None):
         B, T, C = x.size()
         if self.use_iha:
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
@@ -396,6 +403,14 @@ class CausalSelfAttention(nn.Module):
         if v.dtype != fa_dtype:
             v = v.to(dtype=fa_dtype)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, softmax_scale=softmax_scale)
+        if xsa_alpha is not None:
+            v_ref = v
+            if self.n_kv_head != self.n_head:
+                v_ref = v_ref.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+            alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.n_head, 1)
+            v_hat = v_ref / v_ref.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(self.xsa_eps)
+            xsa_coeff = ((y * v_hat).sum(dim=-1, keepdim=True)) * alpha
+            y = torch.addcmul(y, v_hat, xsa_coeff, value=-1.0)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -421,16 +436,16 @@ class Block(nn.Module):
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None, xsa_alpha=None):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
             x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
             x = x + self.mlp(norm(x))
         return x
 
@@ -459,6 +474,7 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
+        self.xsa_alphas = nn.Parameter(torch.zeros(config.n_layer, config.n_head))
         self.rotary_seq_len = config.sequence_len * 10
         if config.use_window_schedule:
             self.yarn = Yarn(head_dim, self.rotary_seq_len)
@@ -507,6 +523,7 @@ class GPT(nn.Module):
                     torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
+        self.xsa_alphas.zero_()
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         self.skip_weights.fill_(1.0)
@@ -553,6 +570,13 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _xsa_enabled(self, layer_idx):
+        if self.config.xsa_mode == "off":
+            return False
+        if self.config.xsa_mode == "first6":
+            return layer_idx < min(6, self.config.n_layer)
+        raise ValueError(f"unknown xsa_mode: {self.config.xsa_mode}")
+
     def _get_cos_sin(self, seq_len):
         if hasattr(self, "yarn"):
             return self.yarn.cos[:, :seq_len], self.yarn.sin[:, :seq_len]
@@ -575,7 +599,8 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
-                          + self.skip_weights.numel())
+                          + self.skip_weights.numel()
+                          + self.xsa_alphas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
@@ -607,6 +632,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
+        xsa_params = [self.xsa_alphas] if self.config.xsa_mode != "off" else []
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -619,6 +645,9 @@ class GPT(nn.Module):
         if iha_params:
             param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr,
                                      betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+        if xsa_params:
+            param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
+                                     betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -640,7 +669,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
+            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -655,7 +685,8 @@ class GPT(nn.Module):
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
+            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -1118,6 +1149,7 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
+print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
 if args.window_schedule:
     print0(f"  window_schedule={args.window_schedule_spec}")
 print0(f"-----------------------")
@@ -1141,7 +1173,8 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
                    use_iha=args.iha,
                    iha_mix_v=args.iha,
-                   use_window_schedule=bool(args.window_schedule))
+                   use_window_schedule=bool(args.window_schedule),
+                   xsa_mode=args.xsa_mode)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1369,6 +1402,10 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         # num_iterations = steps_per_epoch * args.num_epochs
         # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
+
+    if args.max_train_steps > 0 and step >= args.max_train_steps:
+        print0(f"Reached max_train_steps={args.max_train_steps}")
+        break
 
     # GC management
     if step == 1:
