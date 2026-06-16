@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# One-shot runner for the NanoGPT Slowrun two-hour track attempt
+# (baseline + document-level shuffling + learnable XSA).
+#
+# Usage on the cluster (zero setup):
+#   curl -sL https://raw.githubusercontent.com/AjAnubolu/slowrun/two-hour-doc-shuffle-xsa/run_two_hour.sh | bash
+# or, if you already cloned the repo:
+#   ./run_two_hour.sh [extra args passed through to two_hour/train.py]
+#
+# Optional environment variables:
+#   HF_TOKEN         HuggingFace token (avoids FineWeb download rate-limits). Recommended.
+#   WANDB_API_KEY    Weights & Biases key for the live run link (needed for the record PR).
+#                    If unset, the run logs to wandb OFFLINE so it never blocks.
+#   RUN_ID           Run name (default: two_hour_<timestamp>).
+#   NPROC            GPUs to use (default: auto-detect; the valid record config is 8xH100).
+set -euo pipefail
+
+REPO_URL="https://github.com/AjAnubolu/slowrun.git"
+BRANCH="two-hour-doc-shuffle-xsa"
+RUN_ID="${RUN_ID:-two_hour_$(date +%Y%m%d_%H%M%S)}"
+
+# --- 0. Get into the repo (clone if we're being piped in via curl) -----------
+if [ ! -f two_hour/train.py ]; then
+  if [ ! -d slowrun ]; then
+    echo ">>> Cloning $REPO_URL ($BRANCH)"
+    git clone --branch "$BRANCH" --single-branch "$REPO_URL"
+  fi
+  cd slowrun
+fi
+echo ">>> Working dir: $(pwd)  |  commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# --- 1. Dependencies ---------------------------------------------------------
+echo ">>> Installing requirements"
+pip install -q -r requirements.txt
+
+# --- 2. Secrets / logging mode ----------------------------------------------
+if [ -z "${HF_TOKEN:-}" ]; then
+  echo "!!! HF_TOKEN not set — FineWeb is public so this may still work, but could hit rate limits."
+else
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"   # datasets reads either name
+fi
+if [ -z "${WANDB_API_KEY:-}" ]; then
+  echo "!!! WANDB_API_KEY not set — logging to wandb OFFLINE (no live link; fine for a first run)."
+  export WANDB_MODE=offline
+fi
+
+# --- 3. Data (idempotent: skip if already prepared) --------------------------
+if [ -f fineweb_data/fineweb_train.pt ] && [ -f fineweb_data/fineweb_val.pt ]; then
+  echo ">>> FineWeb data already present, skipping prepare_data.py"
+else
+  echo ">>> Preparing FineWeb data (100M train / 10M val tokens)"
+  python prepare_data.py
+fi
+
+# --- 4. GPU sanity -----------------------------------------------------------
+DETECTED=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+NPROC="${NPROC:-$DETECTED}"
+if [ "$NPROC" -eq 0 ]; then echo "ERROR: no GPUs detected"; exit 1; fi
+echo ">>> Detected $DETECTED GPU(s); using nproc_per_node=$NPROC"
+nvidia-smi -L | head -1 || true
+if [ "$NPROC" -ne 8 ]; then
+  echo "!!! WARNING: the valid two-hour record config is a single 8xH100 node."
+  echo "!!! Running with $NPROC GPUs is fine for testing but is NOT a submittable record."
+fi
+
+# --- 5. Train ----------------------------------------------------------------
+mkdir -p runs
+echo ">>> Launching two-hour run '$RUN_ID' (defaults: doc-shuffle ON, xsa-mode=first6, 22 epochs)"
+echo ">>> WATCH the early 'eta:' line — the cap is 120 min and the record runs ~118 min."
+echo ">>>   If eta projects > ~119 min, re-run with: NPROC=$NPROC ./run_two_hour.sh --max-train-steps <N>"
+set -x
+torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py \
+  --run "$RUN_ID" "$@" 2>&1 | tee "runs/${RUN_ID}.log"
+set +x
+echo ">>> Done. Log saved to runs/${RUN_ID}.log"
+echo ">>> Final val loss (target: beat 3.144):"
+grep -iE "val/loss|best_val|final" "runs/${RUN_ID}.log" | tail -5 || true
