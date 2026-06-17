@@ -27,6 +27,10 @@ if [ ! -f two_hour/train.py ]; then
   fi
   cd slowrun
 fi
+# Sync an existing clone to the latest branch tip (untracked data/kernel dirs are preserved).
+echo ">>> Syncing repo to latest $BRANCH"
+git fetch --depth 1 origin "$BRANCH" 2>/dev/null && git reset --hard FETCH_HEAD 2>/dev/null \
+  || echo "!!! could not sync (offline?); using existing checkout"
 echo ">>> Working dir: $(pwd)  |  commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # --- 1. Dependencies ---------------------------------------------------------
