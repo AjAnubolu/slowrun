@@ -81,6 +81,24 @@ fi
 export SLOWRUN_FA3_REPO="$KERNEL_DIR"
 echo ">>> SLOWRUN_FA3_REPO=$SLOWRUN_FA3_REPO  builds: $(ls "$KERNEL_DIR/build" 2>/dev/null | tr '\n' ' ')"
 
+# --- 3c. Python dev headers (Triton JITs cuda_utils.c, needs Python.h) --------
+# The node lacks the python3.12-dev system package, so stage the exact 3.12.3
+# headers and add them to the compiler search path (no sudo needed).
+if ! python -c "import sysconfig,os,sys; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('include'),'Python.h')) else 1)" 2>/dev/null; then
+  HDR_DIR="$PWD/py312_headers"
+  if [ ! -f "$HDR_DIR/python3.12/Python.h" ]; then
+    echo ">>> Downloading staged Python 3.12 dev headers from GitHub release"
+    mkdir -p "$HDR_DIR"
+    curl -fL --retry 5 --retry-delay 3 -o py312_headers.tgz "$DATA_BASE/py312_headers.tgz"
+    tar -xzf py312_headers.tgz -C "$HDR_DIR"
+    rm -f py312_headers.tgz
+  fi
+  export CPATH="$HDR_DIR/python3.12:$HDR_DIR/x86_64-linux-gnu/python3.12:${CPATH:-}"
+  echo ">>> Staged Python.h on CPATH (no system python3.12-dev): $HDR_DIR/python3.12"
+else
+  echo ">>> System Python.h present; Triton JIT will use it"
+fi
+
 # --- 4. GPU sanity -----------------------------------------------------------
 DETECTED=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
 NPROC="${NPROC:-$DETECTED}"
