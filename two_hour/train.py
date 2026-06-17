@@ -243,6 +243,14 @@ def _load_fa3():
         if major != 9:
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        # Offline clusters with no huggingface.co egress can set SLOWRUN_FA3_REPO to a
+        # locally-staged copy of kernels-community/flash-attn3 (containing build/<variant>/...).
+        # Loads the identical kernel binary; default hub path below is unchanged otherwise.
+        local_repo = os.environ.get("SLOWRUN_FA3_REPO")
+        if local_repo:
+            from pathlib import Path
+            from kernels import get_local_kernel
+            return get_local_kernel(Path(local_repo))
         from kernels import get_kernel
         return get_kernel('kernels-community/flash-attn3', version=1)
     except ImportError:

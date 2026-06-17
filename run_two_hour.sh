@@ -63,6 +63,20 @@ echo ">>> Verifying data integrity (SHA256)"
 echo "${VAL_SHA}  fineweb_data/fineweb_val.pt"     | sha256sum -c - || { echo "ERROR: val data hash mismatch"; exit 1; }
 echo "${TRAIN_SHA}  fineweb_data/fineweb_train.pt" | sha256sum -c - || { echo "ERROR: train data hash mismatch"; exit 1; }
 
+# --- 3b. FA3 kernel (node can't reach huggingface.co; load a staged copy) -----
+# kernels.get_local_kernel() runs the same variant-resolution logic offline, so
+# this is the identical FA3 binary the hub would serve, just relayed via GitHub.
+KERNEL_DIR="$PWD/fa3_kernel"
+if [ ! -d "$KERNEL_DIR/build" ]; then
+  echo ">>> Downloading staged FA3 kernel (cu128) from GitHub release"
+  mkdir -p "$KERNEL_DIR"
+  curl -fL --retry 5 --retry-delay 3 -o fa3_cu128.tgz "$DATA_BASE/fa3_cu128.tgz"
+  tar -xzf fa3_cu128.tgz -C "$KERNEL_DIR"
+  rm -f fa3_cu128.tgz
+fi
+export SLOWRUN_FA3_REPO="$KERNEL_DIR"
+echo ">>> SLOWRUN_FA3_REPO=$SLOWRUN_FA3_REPO  builds: $(ls "$KERNEL_DIR/build" 2>/dev/null | tr '\n' ' ')"
+
 # --- 4. GPU sanity -----------------------------------------------------------
 DETECTED=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
 NPROC="${NPROC:-$DETECTED}"
