@@ -79,9 +79,11 @@ mkdir -p runs
 echo ">>> Launching two-hour run '$RUN_ID' (defaults: doc-shuffle ON, xsa-mode=first6, 22 epochs)"
 echo ">>> WATCH the early 'eta:' line — the cap is 120 min and the record runs ~118 min."
 echo ">>>   If eta projects > ~119 min, re-run with: NPROC=$NPROC ./run_two_hour.sh --max-train-steps <N>"
+# NOTE: do not pass --run here. This torchrun version greedily matches the
+# script's --run flag to its own --run-path (argparse prefix matching), so the
+# script auto-names the run by timestamp instead. Our log file uses RUN_ID below.
 set -x
-torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py \
-  --run "$RUN_ID" "$@" 2>&1 | tee "runs/${RUN_ID}.log"
+torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py "$@" 2>&1 | tee "runs/${RUN_ID}.log"
 set +x
 echo ">>> Done. Log saved to runs/${RUN_ID}.log"
 echo ">>> Final val loss (target: beat 3.144):"
