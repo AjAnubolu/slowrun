@@ -44,13 +44,24 @@ if [ -z "${WANDB_API_KEY:-}" ]; then
   export WANDB_MODE=offline
 fi
 
-# --- 3. Data (idempotent: skip if already prepared) --------------------------
+# --- 3. Data: pull pre-built CANONICAL files from the GitHub release ----------
+# The cluster nodes can't reach huggingface.co reliably (and FineWeb needs auth),
+# so the canonical 100M/10M-token files are hosted as release assets and verified
+# by SHA256 (same hashes prepare_data.py asserts). Falls back to HF if both unset.
+DATA_BASE="https://github.com/AjAnubolu/slowrun/releases/download/data-v1"
+TRAIN_SHA="36e7c95c1e7f6ed952fb002d76a03044e8617fea7e696a68d7dc1ce78465dcaf"
+VAL_SHA="6868ed375b289a89c72c2f9df1ecbdcff700c4b9478ca806435d2dbfad8573b1"
+mkdir -p fineweb_data
 if [ -f fineweb_data/fineweb_train.pt ] && [ -f fineweb_data/fineweb_val.pt ]; then
-  echo ">>> FineWeb data already present, skipping prepare_data.py"
+  echo ">>> FineWeb data already present, skipping download"
 else
-  echo ">>> Preparing FineWeb data (100M train / 10M val tokens)"
-  python prepare_data.py
+  echo ">>> Downloading pre-built canonical FineWeb data from GitHub release"
+  curl -fL --retry 5 --retry-delay 3 -o fineweb_data/fineweb_val.pt   "$DATA_BASE/fineweb_val.pt"
+  curl -fL --retry 5 --retry-delay 3 -o fineweb_data/fineweb_train.pt "$DATA_BASE/fineweb_train.pt"
 fi
+echo ">>> Verifying data integrity (SHA256)"
+echo "${VAL_SHA}  fineweb_data/fineweb_val.pt"     | sha256sum -c - || { echo "ERROR: val data hash mismatch"; exit 1; }
+echo "${TRAIN_SHA}  fineweb_data/fineweb_train.pt" | sha256sum -c - || { echo "ERROR: train data hash mismatch"; exit 1; }
 
 # --- 4. GPU sanity -----------------------------------------------------------
 DETECTED=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
