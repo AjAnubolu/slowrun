@@ -93,7 +93,7 @@ if ! python -c "import sysconfig,os,sys; sys.exit(0 if os.path.exists(os.path.jo
     tar -xzf py312_headers.tgz -C "$HDR_DIR"
     rm -f py312_headers.tgz
   fi
-  export CPATH="$HDR_DIR/python3.12:$HDR_DIR/x86_64-linux-gnu/python3.12:${CPATH:-}"
+  export CPATH="$HDR_DIR/python3.12:$HDR_DIR:$HDR_DIR/x86_64-linux-gnu/python3.12:${CPATH:-}"
   echo ">>> Staged Python.h on CPATH (no system python3.12-dev): $HDR_DIR/python3.12"
 else
   echo ">>> System Python.h present; Triton JIT will use it"
