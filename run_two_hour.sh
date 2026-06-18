@@ -118,8 +118,15 @@ echo ">>>   If eta projects > ~119 min, re-run with: NPROC=$NPROC ./run_two_hour
 # NOTE: do not pass --run here. This torchrun version greedily matches the
 # script's --run flag to its own --run-path (argparse prefix matching), so the
 # script auto-names the run by timestamp instead. Our log file uses RUN_ID below.
+# Storage knobs for the logit-averaging snapshot ensemble (each ckpt ~2.7GB):
+#   LOGIT_AVG_DIR=/scratch/ck  redirect checkpoints to a bigger volume (lossless, keeps all)
+#   LOGIT_AVG=4                keep fewer checkpoints (default 11 ~= 30GB; min 2 to still ensemble)
+EXTRA=()
+[ -n "${LOGIT_AVG:-}" ]     && EXTRA+=(--logit-avg "$LOGIT_AVG")
+[ -n "${LOGIT_AVG_DIR:-}" ] && EXTRA+=(--logit-avg-dir "$LOGIT_AVG_DIR")
+[ ${#EXTRA[@]} -gt 0 ] && echo ">>> logit-avg storage knobs: ${EXTRA[*]}"
 set -x
-torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py "$@" 2>&1 | tee "runs/${RUN_ID}.log"
+torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py "${EXTRA[@]+"${EXTRA[@]}"}" "$@" 2>&1 | tee "runs/${RUN_ID}.log"
 set +x
 echo ">>> Done. Log saved to runs/${RUN_ID}.log"
 echo ">>> Final val loss (target: beat 3.144):"
