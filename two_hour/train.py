@@ -89,12 +89,6 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
 parser.add_argument("--window-schedule", type=str, default="1-6:256,768;7-13:768,1792;14-22:1280,2048",
                     help="Epoch-window schedule 'start-end:short,long;...'. Applies YaRN on long-window expansions.")
-parser.add_argument("--no-doc-shuffle", action="store_true",
-                    help="Disable per-epoch document reshuffling (still shuffles batch order)")
-parser.add_argument("--max-train-steps", type=int, default=0,
-                    help="Stop after this many optimizer steps. Use 0 to train for all epochs.")
-parser.add_argument("--xsa-mode", choices=("off", "first6"), default="first6",
-                    help="Exclusive self-attention schedule.")
 args = parser.parse_args()
 args.window_schedule_spec = args.window_schedule.strip()
 
@@ -116,7 +110,6 @@ WINDOW_PATTERN = "SSSL"
 TOTAL_BATCH_SIZE = args.total_batch_size
 EVAL_TOKENS = 10_000_000
 DATA_DIR = "fineweb_data"
-BOS_ID = 50256  # <|endoftext|>
 
 # Base optimizer hyperparameters
 BASE_MATRIX_LR = args.matrix_lr
@@ -243,9 +236,7 @@ def _load_fa3():
         if major != 9:
             return None
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        # Offline clusters with no huggingface.co egress can set SLOWRUN_FA3_REPO to a
-        # locally-staged copy of kernels-community/flash-attn3 (containing build/<variant>/...).
-        # Loads the identical kernel binary; default hub path below is unchanged otherwise.
+        # Offline clusters: load a locally-staged kernels-community/flash-attn3 if provided.
         local_repo = os.environ.get("SLOWRUN_FA3_REPO")
         if local_repo:
             from pathlib import Path
@@ -286,8 +277,6 @@ class GPTConfig:
     use_iha: bool = False
     iha_mix_v: bool = True
     use_window_schedule: bool = False
-    xsa_mode: str = "first6"
-    xsa_eps: float = 1e-4
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -363,7 +352,6 @@ class CausalSelfAttention(nn.Module):
         # Attention gate: per-head gating to enable context-based no-op
         self.attn_gate_channels = 12
         self.attn_gate = nn.Linear(self.attn_gate_channels, self.n_head, bias=False)
-        self.xsa_eps = config.xsa_eps
         # IHA: cross-head mixing matrices fused into projection weights at forward time.
         self.use_iha = config.use_iha
         if self.use_iha:
@@ -377,7 +365,7 @@ class CausalSelfAttention(nn.Module):
         d = self.head_dim
         return (mix @ weight.view(H, d, -1).flatten(1)).view_as(weight)
 
-    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None, xsa_alpha=None):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         B, T, C = x.size()
         if self.use_iha:
             q = F.linear(x, self._fuse_mix(self.c_q.weight, self.q_mix, self.n_head))
@@ -411,14 +399,6 @@ class CausalSelfAttention(nn.Module):
         if v.dtype != fa_dtype:
             v = v.to(dtype=fa_dtype)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size, softmax_scale=softmax_scale)
-        if xsa_alpha is not None:
-            v_ref = v
-            if self.n_kv_head != self.n_head:
-                v_ref = v_ref.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
-            alpha = torch.tanh(xsa_alpha).type_as(y).view(1, 1, self.n_head, 1)
-            v_hat = v_ref / v_ref.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(self.xsa_eps)
-            xsa_coeff = ((y * v_hat).sum(dim=-1, keepdim=True)) * alpha
-            y = torch.addcmul(y, v_hat, xsa_coeff, value=-1.0)
         # Attention gate: per-head sigmoid gate
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
@@ -444,16 +424,16 @@ class Block(nn.Module):
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None, xsa_alpha=None):
+    def forward(self, x, ve, cos_sin, window_size, softmax_scale=None):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, softmax_scale=softmax_scale)
             x = x + self.mlp(norm(x))
         return x
 
@@ -482,7 +462,6 @@ class GPT(nn.Module):
         # U-Net skip connections: encoder layer i → decoder layer (n_layer - 1 - i)
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
-        self.xsa_alphas = nn.Parameter(torch.zeros(config.n_layer, config.n_head))
         self.rotary_seq_len = config.sequence_len * 10
         if config.use_window_schedule:
             self.yarn = Yarn(head_dim, self.rotary_seq_len)
@@ -531,7 +510,6 @@ class GPT(nn.Module):
                     torch.nn.init.eye_(block.attn.v_mix)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
-        self.xsa_alphas.zero_()
         for proj in self.ve_projs.values():
             torch.nn.init.uniform_(proj.weight, -s, s)
         self.skip_weights.fill_(1.0)
@@ -578,13 +556,6 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def _xsa_enabled(self, layer_idx):
-        if self.config.xsa_mode == "off":
-            return False
-        if self.config.xsa_mode == "first6":
-            return layer_idx < min(6, self.config.n_layer)
-        raise ValueError(f"unknown xsa_mode: {self.config.xsa_mode}")
-
     def _get_cos_sin(self, seq_len):
         if hasattr(self, "yarn"):
             return self.yarn.cos[:, :seq_len], self.yarn.sin[:, :seq_len]
@@ -607,8 +578,7 @@ class GPT(nn.Module):
         nparams_exclude = (self.transformer.wte.weight.numel()
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
-                          + self.skip_weights.numel()
-                          + self.xsa_alphas.numel())
+                          + self.skip_weights.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
@@ -640,7 +610,6 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
-        xsa_params = [self.xsa_alphas] if self.config.xsa_mode != "off" else []
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -653,9 +622,6 @@ class GPT(nn.Module):
         if iha_params:
             param_groups.append(dict(kind='adamw', params=iha_params, lr=args.iha_lr,
                                      betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
-        if xsa_params:
-            param_groups.append(dict(kind='adamw', params=xsa_params, lr=SCALAR_LR,
-                                     betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -677,8 +643,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
         return x
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
@@ -693,8 +658,7 @@ class GPT(nn.Module):
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            xsa_alpha = self.xsa_alphas[i] if self._xsa_enabled(i) else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale, xsa_alpha=xsa_alpha)
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], softmax_scale=softmax_scale)
             encoder_outputs.append(x)
 
         # Decoder half
@@ -922,78 +886,49 @@ class DistMuonAdamW(torch.optim.Optimizer):
 # =============================================================================
 
 class DataLoader:
-    """Loads flat tokens , chunks into batches.
+    """Pre-tokenized dataloader. Yields (inputs, targets, epoch) forever."""
 
-    doc_shuffle=False: applies the stored default sequence permutation (bitwise match
-    with the old chunked pipeline), shuffles batch order each epoch.
-    doc_shuffle=True: reshuffles documents each epoch, re-chunks, re-shuffles sequences.
-
-    Always yields (x, y, epoch).
-    """
-
-    def __init__(self, filepath, B, T, device="cuda", doc_shuffle=False):
+    def __init__(self, filepath, B, T, device="cuda"):
         data = torch.load(filepath, weights_only=True)
         all_tokens = data["tokens"].long()
-        raw_doc_starts = data["doc_starts"].long()
-        bos_id = int(data["bos_id"])
-        assert bos_id == BOS_ID, f"data bos_id {bos_id} != expected {BOS_ID}"
+        sequence_size = T + 1
 
-        doc_ends = torch.cat([raw_doc_starts[1:], torch.tensor([all_tokens.numel()])])
-        self.doc_tokens = [all_tokens[s:e] for s, e in zip(raw_doc_starts.tolist(), doc_ends.tolist())]
-        self.default_shuffle_seed = data["seq_shuffle_seed"]
+        # Reconstruct the old sequence ordering from flat tokens
+        num_seqs = len(all_tokens) // sequence_size
+        all_seqs = all_tokens[:num_seqs * sequence_size].view(num_seqs, sequence_size)
+        perm = np.random.RandomState(data["seq_shuffle_seed"]).permutation(num_seqs)
+        all_seqs = all_seqs[torch.from_numpy(perm)]  # (N, T+1)
 
+        # DDP sharding: each rank gets every world_size-th batch
         _, rank, _, world_size = get_dist_info()
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
-        self.B = B
-        self.T = T
-        self.seq_size = T + 1
-        self.doc_shuffle = doc_shuffle
-        self.epoch = 1
-        self._build_batches()
-
-    def _build_batches(self):
-        tokens = torch.cat(self.doc_tokens)
-        num_seqs = len(tokens) // self.seq_size
-        all_seqs = tokens[:num_seqs * self.seq_size].view(num_seqs, self.seq_size)
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch + 1000)
-            all_seqs = all_seqs[torch.randperm(num_seqs, generator=g)]
-        else:
-            perm = np.random.RandomState(self.default_shuffle_seed).permutation(num_seqs)
-            all_seqs = all_seqs[torch.from_numpy(perm)]
-        seqs_per_step = self.B * self.world_size
+        seqs_per_step = B * world_size
         num_steps = len(all_seqs) // seqs_per_step
         usable = num_steps * seqs_per_step
-        all_seqs = all_seqs[:usable].view(num_steps, self.world_size, self.B, self.seq_size)
-        self.rank_data = all_seqs[:, self.rank].contiguous()
+        all_seqs = all_seqs[:usable].view(num_steps, world_size, B, sequence_size)
+
+        self.rank_data = all_seqs[:, rank].contiguous()  # (num_steps, B, T+1)
         self.num_steps = num_steps
-        self.total_tokens = usable * self.T
+        self.total_tokens = usable * T  # trainable tokens across all ranks
+        self.device = device
         self.pos = 0
+        self.epoch = 1
 
     def __iter__(self):
         return self
 
-    def _next_epoch(self):
-        self.epoch += 1
-        print0(f"Starting epoch {self.epoch}")
-        if self.doc_shuffle:
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            perm = torch.randperm(len(self.doc_tokens), generator=g)
-            self.doc_tokens = [self.doc_tokens[i] for i in perm.tolist()]
-            self._build_batches()
-        else:
-            self.pos = 0
-            g = torch.Generator()
-            g.manual_seed(self.epoch)
-            self.rank_data = self.rank_data[torch.randperm(self.num_steps, generator=g)]
+    def _shuffle(self):
+        """Shuffle batch order for the new epoch, consistent across ranks."""
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        perm = torch.randperm(self.num_steps, generator=g)
+        self.rank_data = self.rank_data[perm]
 
     def __next__(self):
         if self.pos >= self.num_steps:
-            self._next_epoch()
+            self.pos = 0
+            self.epoch += 1
+            print0(f"Starting epoch {self.epoch}")
+            self._shuffle()
         batch = self.rank_data[self.pos].to(self.device, non_blocking=True)
         self.pos += 1
         return batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), self.epoch
@@ -1156,8 +1091,7 @@ print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
-print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
-print0(f"  max_train_steps={args.max_train_steps}, xsa_mode={args.xsa_mode}")
+print0(f"  dropout={args.dropout}")
 if args.window_schedule:
     print0(f"  window_schedule={args.window_schedule_spec}")
 print0(f"-----------------------")
@@ -1181,8 +1115,7 @@ config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
                    use_iha=args.iha,
                    iha_mix_v=args.iha,
-                   use_window_schedule=bool(args.window_schedule),
-                   xsa_mode=args.xsa_mode)
+                   use_window_schedule=bool(args.window_schedule))
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1213,7 +1146,7 @@ optimizer = model.setup_optimizer()
 # Dataloaders
 _train_path = args.input_bin if args.input_bin else os.path.join(DATA_DIR, "fineweb_train.pt")
 _val_path = args.input_val_bin if args.input_val_bin else os.path.join(DATA_DIR, "fineweb_val.pt")
-train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device, doc_shuffle=not args.no_doc_shuffle)
+train_loader = DataLoader(_train_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 build_val_loader = lambda: DataLoader(_val_path, args.device_batch_size, MAX_SEQ_LEN, device=device)
 TOKENS_PER_EPOCH = train_loader.total_tokens
 x, y, current_epoch = next(train_loader)
@@ -1410,10 +1343,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         # num_iterations = steps_per_epoch * args.num_epochs
         # print0(f"Epoch {current_epoch} took {steps_per_epoch} steps. Updated estimate: {num_iterations} total steps.")
         current_epoch = epoch
-
-    if args.max_train_steps > 0 and step >= args.max_train_steps:
-        print0(f"Reached max_train_steps={args.max_train_steps}")
-        break
 
     # GC management
     if step == 1:

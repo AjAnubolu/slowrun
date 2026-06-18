@@ -16,7 +16,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/AjAnubolu/slowrun.git"
-BRANCH="two-hour-doc-shuffle-xsa"
+BRANCH="baseline-offline"
 RUN_ID="${RUN_ID:-two_hour_$(date +%Y%m%d_%H%M%S)}"
 
 # --- 0. Get into the repo (clone if we're being piped in via curl) -----------
