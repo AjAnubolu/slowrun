@@ -124,6 +124,9 @@ echo ">>>   If eta projects > ~119 min, re-run with: NPROC=$NPROC ./run_two_hour
 EXTRA=()
 [ -n "${LOGIT_AVG:-}" ]     && EXTRA+=(--logit-avg "$LOGIT_AVG")
 [ -n "${LOGIT_AVG_DIR:-}" ] && EXTRA+=(--logit-avg-dir "$LOGIT_AVG_DIR")
+# Ablation knobs: XSA_MODE=off (disable learnable XSA), DOC_SHUFFLE=off (disable doc shuffling)
+[ -n "${XSA_MODE:-}" ]     && EXTRA+=(--xsa-mode "$XSA_MODE")
+[ "${DOC_SHUFFLE:-}" = "off" ] && EXTRA+=(--no-doc-shuffle)
 [ ${#EXTRA[@]} -gt 0 ] && echo ">>> logit-avg storage knobs: ${EXTRA[*]}"
 set -x
 torchrun --standalone --nproc_per_node="$NPROC" two_hour/train.py "${EXTRA[@]+"${EXTRA[@]}"}" "$@" 2>&1 | tee "runs/${RUN_ID}.log"
